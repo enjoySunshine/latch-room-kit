@@ -160,10 +160,13 @@ async function connect() {
     //
   });
 
-  room.send("move", { x: 100, y: 200 });
+  room.send("move", { seq: 1, x: 100, y: 200 });
 
   // @ts-expect-error - "movee" is not a valid message type
   room.send("movee", { x: 100, y: 200 });
+
+  // @ts-expect-error - "move" requires a monotonic seq
+  room.send("move", { x: 100, y: 200 });
 
   const $ = getStateCallbacks(room);
   $(room.state).players.onAdd((player, sessionId) => {

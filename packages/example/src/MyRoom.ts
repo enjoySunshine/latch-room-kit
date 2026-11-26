@@ -51,8 +51,16 @@ const thirdPartyMessages: Messages<MyRoom> = {
   // },
 }
 
+/** Per-client, server-only move ordering bookkeeping (never replicated). */
+interface MoveBookkeeping {
+  /** Highest seq already written onto the player's state. */
+  lastAppliedSeq: number;
+  /** Higher-seq packets that landed before a missing lower seq. */
+  pendingMoves: Map<number, { x: number; y: number }>;
+}
+
 type MyClient = Client<{
-  userData: { custom: boolean };
+  userData: MoveBookkeeping & { custom?: boolean };
   auth: { custom: boolean };
   messages: {
     nopayload: never;
@@ -69,6 +77,13 @@ const Input = schema({
   y: t.number(),
 });
 type Input = SchemaType<typeof Input>;
+
+/**
+ * Out-of-order window kept per client before we give up on a missing seq.
+ * Normal reordering only spans a handful of packets; the cap just stops a
+ * silently-lost packet from pinning a player's input forever.
+ */
+const MAX_PENDING_MOVES = 256;
 
 export class MyRoom extends Room<{ state: MyRoomState, client: MyClient, input: Input }> {
   state = new MyRoomState();
@@ -110,14 +125,67 @@ export class MyRoom extends Room<{ state: MyRoomState, client: MyClient, input: 
   messages = {
     ...thirdPartyMessages,
     move: validate(z.object({
+      seq: z.number().int().positive(),
       x: z.number(),
       y: z.number(),
       z: z.number().optional()
     }), (client, message) => {
-      const player = this.state.players.get(client.sessionId)!;
-      player.x = message.x;
-      player.y = message.y;
-      console.log("MOVE", { sessionId: client.sessionId, VERSION });
+      const player = this.state.players.get(client.sessionId);
+      if (!player) { return; }
+
+      // Per-client ordering bookkeeping lives on userData (never replicated).
+      // userData is optional on the base Client, so make sure it exists.
+      const userData: MoveBookkeeping = client.userData ?? {
+        lastAppliedSeq: 0,
+        pendingMoves: new Map(),
+      };
+      client.userData = userData as MyClient['userData'];
+      if (typeof userData.lastAppliedSeq !== "number") {
+        userData.lastAppliedSeq = 0;
+        userData.pendingMoves = new Map();
+      }
+
+      const { seq, x, y } = message;
+
+      // A seq we already wrote (duplicate) or one older than it (late packet)
+      // must never move the player backwards. Drop it before it can
+      // overwrite a newer landing point.
+      if (seq <= userData.lastAppliedSeq) {
+        return;
+      }
+
+      // Hold out-of-order packets: 22 and 23 arriving before 21 stay buffered
+      // so the replay still walks 105,105 -> 110,110 -> 115,115 in order and
+      // the canvas (a pure view of this state) makes every step. The frontier
+      // packet (seq === lastAppliedSeq + 1) is never buffered — it closes the
+      // gap and drives the replay below.
+      if (seq > userData.lastAppliedSeq + 1) {
+        if (!userData.pendingMoves.has(seq)) {
+          userData.pendingMoves.set(seq, { x, y });
+        }
+        if (userData.pendingMoves.size <= MAX_PENDING_MOVES) {
+          return;
+        }
+        // A seq appears to be lost: skip the gap rather than freeze movement
+        // forever. Everything below the new frontier is dropped with it.
+        userData.lastAppliedSeq = Math.min(...userData.pendingMoves.keys()) - 1;
+      }
+
+      // Merge the frontier packet with the buffer, then write every
+      // contiguous seq in order — each one lands its own (x, y) on state.
+      const queue = new Map<number, { x: number; y: number }>(userData.pendingMoves);
+      queue.set(userData.lastAppliedSeq + 1, { x, y });
+
+      while (queue.has(userData.lastAppliedSeq + 1)) {
+        const applySeq = userData.lastAppliedSeq + 1;
+        const position = queue.get(applySeq)!;
+        player.x = position.x;
+        player.y = position.y;
+        userData.lastAppliedSeq = applySeq;
+        userData.pendingMoves.delete(applySeq);
+      }
+
+      console.log("MOVE", { sessionId: client.sessionId, VERSION, seq: userData.lastAppliedSeq, x: player.x, y: player.y });
     }),
 
     nopayload_2: (client: MyClient, message: any) => {
@@ -149,11 +217,22 @@ export class MyRoom extends Room<{ state: MyRoomState, client: MyClient, input: 
     this.setSimulationInterval(() => this.update());
   }
 
-  onJoin(client: MyClient, options: any) {
+  onJoin(client: MyClient, options: { x?: number; y?: number } = {}) {
     const player = new Player();
-    player.x = Math.random() * this.state.mapWidth;
-    player.y = Math.random() * this.state.mapHeight;
+    // A caller may pin the spawn (tests need a deterministic origin); the
+    // default stays a random point inside the map.
+    player.x = typeof options.x === "number" ? options.x : Math.random() * this.state.mapWidth;
+    player.y = typeof options.y === "number" ? options.y : Math.random() * this.state.mapHeight;
     this.state.players.set(client.sessionId, player);
+
+    // Move ordering bookkeeping (never replicated — userData stays server-side).
+    // userData is optional on the base Client, so assign it rather than mutate.
+    client.userData = {
+      ...(client.userData ?? {}),
+      lastAppliedSeq: 0,
+      pendingMoves: new Map(),
+    } as MyClient['userData'];
+
     console.log("ON JOIN", { VERSION });
   }
 

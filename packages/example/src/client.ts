@@ -3,6 +3,7 @@ import { Client, Callbacks, Room } from '@colyseus/sdk';
 
 import type { server } from './server/vite.ts';
 import type { MyRoom } from './MyRoom.ts';
+import { MovementController, MOVE_INTERVAL_MS, MOVE_SPEED } from './movement.ts';
 
 const logElement = document.querySelector<HTMLPreElement>('#log');
 const button = document.querySelector<HTMLButtonElement>('#connect');
@@ -92,15 +93,32 @@ button?.addEventListener('click', async () => {
     // Sync players from state using Callbacks API
     const callbacks = Callbacks.get(room);
 
+    // Sequenced input + local accumulator for our own circle. The canvas
+    // below still renders room state only; the controller decides which
+    // (seq, x, y) each tick sends and reconciles with the room's echoes.
+    const movement = new MovementController();
+
     callbacks.onAdd("players", (player, sessionId) => {
       players.set(sessionId, { x: player.x, y: player.y });
+      if (sessionId === room.sessionId) {
+        // Start the accumulator at the room-assigned spawn point, not (0,0).
+        movement.reset(player.x, player.y);
+      }
       callbacks.listen(player, "x", (value) => {
         const p = players.get(sessionId);
         if (p) p.x = value;
+        if (sessionId === room.sessionId) {
+          const me = players.get(room.sessionId);
+          if (me) movement.reconcile(me.x, me.y);
+        }
       });
       callbacks.listen(player, "y", (value) => {
         const p = players.get(sessionId);
         if (p) p.y = value;
+        if (sessionId === room.sessionId) {
+          const me = players.get(room.sessionId);
+          if (me) movement.reconcile(me.x, me.y);
+        }
       });
       log(`Player joined: ${sessionId}`);
     });
@@ -124,7 +142,6 @@ button?.addEventListener('click', async () => {
     });
 
     // Arrow key movement
-    const speed = 5;
     const keys = new Set<string>();
 
     const onKeyDown = (e: KeyboardEvent) => {
@@ -140,16 +157,22 @@ button?.addEventListener('click', async () => {
 
     const moveLoop = setInterval(() => {
       if (keys.size === 0 || !room) return;
-      let x = 0, y = 0;
-      if (keys.has('ArrowLeft') || keys.has('a')) x -= speed;
-      if (keys.has('ArrowRight') || keys.has('d')) x += speed;
-      if (keys.has('ArrowUp') || keys.has('w')) y -= speed;
-      if (keys.has('ArrowDown') || keys.has('s')) y += speed;
-      if (x !== 0 || y !== 0) {
-        const me = players.get(room.sessionId);
-        room.send('move', { x: (me?.x ?? 0) + x, y: (me?.y ?? 0) + y });
+      let dx = 0, dy = 0;
+      if (keys.has('ArrowLeft') || keys.has('a')) dx -= MOVE_SPEED;
+      if (keys.has('ArrowRight') || keys.has('d')) dx += MOVE_SPEED;
+      if (keys.has('ArrowUp') || keys.has('w')) dy -= MOVE_SPEED;
+      if (keys.has('ArrowDown') || keys.has('s')) dy += MOVE_SPEED;
+
+      // The target comes from the local accumulator, not from the circle's
+      // current canvas position: while an echo is still in flight the canvas
+      // hasn't moved yet, so reading it back would send the same coordinate
+      // on every tick and collapse several presses into one jump. Each tick
+      // still gets its own monotonic seq even before any echo returns.
+      const sample = movement.sample(dx, dy);
+      if (sample) {
+        room.send('move', sample);
       }
-    }, 1000 / 30);
+    }, MOVE_INTERVAL_MS);
 
     room.onLeave(() => {
       clearInterval(moveLoop);
